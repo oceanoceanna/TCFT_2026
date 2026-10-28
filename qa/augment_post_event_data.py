@@ -4,6 +4,7 @@
 Run without flags to validate and preview counts, or with --apply to append.
 The original file hashes guard against accidental reruns or source changes.
 Event dates are inherited from the dataset, not independently fact-checked.
+Each new row contains its provenance in an optional augmentation object.
 """
 import argparse
 import hashlib
@@ -17,6 +18,7 @@ from pathlib import Path
 DATA_DIR = Path(__file__).resolve().parent / "data"
 SEED = 20261028
 OFFSETS = (1, 14, 30)
+AUGMENTATION_METHOD = "rule_based_post_event"
 SOURCE_INFO = {
     "train": (8072, "929b939b0df78f755cecb735caf980762158d8ba304ac186184ea6793130ce3c"),
     "valid": (500, "e96a6b8d134b9577d47b64f7865d62aa21245a78a8a61ba87075f084a0b54dac"),
@@ -90,7 +92,7 @@ def build_augmentation(data_dir):
     all_cells = sorted({cell(row) for row in rows_by_split["train"]})
     assert len(all_cells) == 16
     used_bases, global_event_counts = set(), Counter()
-    additions, provenance = {}, {}
+    additions = {}
     # Reserve candidates for the smaller source partitions first.
     for split in ("valid", "test", "train"):
         base_count = ADDITIONS[split] // len(OFFSETS)
@@ -121,7 +123,7 @@ def build_augmentation(data_dir):
                 global_event_counts[row["event"]] += 1
                 chosen.extend((source_line, row, offset) for offset in OFFSETS)
         rng.shuffle(chosen)
-        additions[split], provenance[split] = [], []
+        additions[split] = []
         for index, (source_line, source, offset) in enumerate(chosen):
             cutoff = (date.fromisoformat(source["true_date"]) + timedelta(days=offset)).isoformat()
             row = dict(source)
@@ -135,27 +137,35 @@ def build_augmentation(data_dir):
                     gap=str(offset) + (" day" if offset == 1 else " days"),
                 ) + "\n\nConclusion: right",
                 "conclusion": "right",
+                "augmentation": {
+                    "method": AUGMENTATION_METHOD,
+                    "seed": SEED,
+                    "source_split": split,
+                    "source_sha256": SOURCE_INFO[split][1],
+                    "output_line": SOURCE_INFO[split][0] + index + 1,
+                    "source_line": source_line,
+                    "days_after_event": offset,
+                    "critique_template": index % len(CRITIQUES) + 1,
+                },
             })
             additions[split].append(row)
-            provenance[split].append({
-                "output_line": SOURCE_INFO[split][0] + index + 1,
-                "source_line": source_line,
-                "days_after_event": offset,
-                "critique_template": index % len(CRITIQUES) + 1,
-            })
 
     seen_prompts = {row["leakage_prompt"] for rows in rows_by_split.values() for row in rows}
     assert len(seen_prompts) == sum(len(rows) for rows in rows_by_split.values())
-    result_bytes, manifest_splits = {}, {}
+    result_bytes, summary_splits = {}, {}
     for split, added in additions.items():
         assert len(added) == ADDITIONS[split]
         assert Counter(row["ask_date_days_before"] for row in added) == {-offset: len(added) // 3 for offset in OFFSETS}
         assert Counter(row["restriction_strength"] for row in added) == {"strong": len(added) // 2, "weak": len(added) // 2}
         assert Counter(row["template_position"] for row in added) == {"prefix": len(added) // 2, "suffix": len(added) // 2}
-        for row, source_info in zip(added, provenance[split]):
+        for row in added:
+            source_info = row["augmentation"]
             source = rows_by_split[split][source_info["source_line"] - 1]
-            assert set(row) == set(source)
-            assert all(type(row[key]) is type(source[key]) for key in row)
+            assert set(row) == set(source) | {"augmentation"}
+            assert all(type(row[key]) is type(source[key]) for key in source)
+            assert source_info["source_split"] == split
+            assert source_info["source_sha256"] == SOURCE_INFO[split][1]
+            assert source_info["days_after_event"] == -row["ask_date_days_before"]
             assert row["leakage_answer_raw"] == row["true_date"]
             assert (date.fromisoformat(row["true_date"]) - date.fromisoformat(row["ask_date"])).days == row["ask_date_days_before"]
             assert row["leakage_prompt"] == source["leakage_prompt"].replace(source["ask_date"], row["ask_date"])
@@ -166,7 +176,7 @@ def build_augmentation(data_dir):
             assert row["true_date"] in row["critique"] and row["ask_date"] in row["critique"]
         appended = "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in added).encode("utf-8")
         result_bytes[split] = originals[split] + appended
-        manifest_splits[split] = {
+        summary_splits[split] = {
             "original_count": SOURCE_INFO[split][0], "added_count": len(added),
             "final_count": SOURCE_INFO[split][0] + len(added),
             "original_bytes": len(originals[split]),
@@ -174,27 +184,26 @@ def build_augmentation(data_dir):
             "final_sha256": sha256(result_bytes[split]),
             "offset_counts": dict(sorted(Counter(-row["ask_date_days_before"] for row in added).items())),
             "unique_added_events": len({row["event"] for row in added}),
-            "provenance": provenance[split],
         }
-    manifest = {
+    summary = {
         "seed": SEED, "total_added": sum(ADDITIONS.values()),
         "method": "Rule-derived correct-date answers and 12 textual critique templates; no API generation or independent fact-check of source event dates.",
         "date_relation": "ask_date = true_date + days_after_event; ask_date_days_before = -days_after_event",
         "excluded_events": sorted(EXCLUDED_EVENTS),
         "split_policy": "Use each partition's own source rows; no normalized event/prompt base is shared between new partitions. Existing event overlap remains.",
-        "splits": manifest_splits,
+        "splits": summary_splits,
     }
-    return originals, result_bytes, manifest
+    return originals, result_bytes, summary
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--apply", action="store_true", help="Append to the three data files and save provenance.")
+    parser.add_argument("--apply", action="store_true", help="Append to the three data files with provenance embedded in each new row.")
     parser.add_argument("--preview-dir", type=Path, help="Write complete candidate files to a separate directory for review.")
     args = parser.parse_args()
     if args.apply and args.preview_dir is not None:
         parser.error("Choose either --apply or --preview-dir.")
-    originals, outputs, manifest = build_augmentation(DATA_DIR)
+    originals, outputs, summary = build_augmentation(DATA_DIR)
     destination = DATA_DIR if args.apply else args.preview_dir
     if destination is not None:
         if not args.apply and destination.resolve() == DATA_DIR.resolve():
@@ -212,13 +221,11 @@ def main():
                     assert (DATA_DIR / (split + ".jsonl")).read_bytes() == original, "Source changed during generation"
             for temporary, path in staged:
                 temporary.replace(path)
-            (destination / "post_event_augmentation_manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         finally:
             for temporary, _ in staged:
                 if temporary.exists():
                     temporary.unlink()
-    summary = {split: {key: value for key, value in info.items() if key != "provenance"} for split, info in manifest["splits"].items()}
-    print(json.dumps({"written_to": str(destination) if destination is not None else None, "splits": summary}, ensure_ascii=False, indent=2))
+    print(json.dumps({"written_to": str(destination) if destination is not None else None, "splits": summary["splits"]}, ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":
