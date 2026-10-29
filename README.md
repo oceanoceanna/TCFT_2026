@@ -6,7 +6,6 @@ Code for **Teaching Large Language Models When Not to Know: Learning Temporal Cr
 
 - `qa/`
   - `data/`: prepared `train.jsonl`, `valid.jsonl`, `test.jsonl`
-  - `augment_post_event_data.py`: reproducibly construct post-event QA examples with provenance embedded in each new row
   - `generate_critiques.py`: generate QA critiques from leakage prompts
   - `train_lora_sft_from_critiques.py`: train a LoRA SFT model on QA critique data
   - `eval_lora_open.py`: generate a critique from the question only, then revise the original answer using the question and generated critique
